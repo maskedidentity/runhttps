@@ -1,0 +1,150 @@
+#!/bin/bash
+OUTPUT_DIR="$HOME/.runhttps"
+mkdir -p "$OUTPUT_DIR"
+TIMESTAMP=$(date +%s)
+URL_FILE="$OUTPUT_DIR/url_$TIMESTAMP.txt"
+PATHS_FILE="$OUTPUT_DIR/paths_$TIMESTAMP.txt"
+URLS_FILE="$OUTPUT_DIR/urls_$TIMESTAMP.txt"
+show_help() {
+    echo "Usage: runhttps [options]"
+    echo ""
+    echo "Options:"
+    echo "  -FUZZ        Run in FUZZ mode (first line = base URL, rest = paths)"
+    echo "  -HTTPX       Run in HTTPX mode (each line = full URL to test)"
+    echo "  -h           Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  FUZZ mode:"
+    echo "    runhttps -FUZZ"
+    echo "    Then paste: https://example.com"
+    echo "                /admin"
+    echo "                /login"
+    echo "                /api"
+    echo ""
+    echo "  HTTPX mode:"
+    echo "    runhttps -HTTPX"
+    echo "    Then paste: https://example.com/admin"
+    echo "                https://example.com/login"
+    echo "                https://api.example.com/v1"
+    echo ""
+    echo "  With command line input:"
+    echo "    echo -e 'https://example.com\\n/admin\\n/login' | runhttps -FUZZ"
+}
+if ! command -v gofuzz &> /dev/null; then
+    echo "Error: gofuzz is not installed or not in PATH"
+    echo "Please build and install gofuzz first:"
+    echo "  go build -o gofuzz main.go"
+    echo "  sudo cp gofuzz /usr/local/bin/"
+    exit 1
+fi
+MODE=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -FUZZ)
+            MODE="FUZZ"
+            shift
+            ;;
+        -HTTPX)
+            MODE="HTTPX"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+if [ -z "$MODE" ]; then
+    echo "Error: Please specify a mode: -FUZZ or -HTTPX"
+    echo ""
+    show_help
+    exit 1
+fi
+read_input() {
+    # Check if stdin is a terminal (interactive) or pipe/file
+    if [ -t 0 ]; then
+        # Interactive mode - show prompt but don't include it in input
+        echo "Enter/Paste your input (first line = URL for FUZZ mode, Ctrl+D when done):" >&2
+        # Read from terminal
+        cat
+    else
+        # Piped input or from file
+        cat
+    fi
+}
+INPUT_CONTENT=$(read_input)
+
+if [ -z "$INPUT_CONTENT" ]; then
+    echo "Error: No input provided"
+    exit 1
+fi
+INPUT_CONTENT=$(echo "$INPUT_CONTENT" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+LINE_COUNT=$(echo "$INPUT_CONTENT" | wc -l)
+
+if [ "$MODE" = "FUZZ" ]; then
+    # FUZZ MODE
+    if [ "$LINE_COUNT" -lt 2 ]; then
+        echo "Error: FUZZ mode needs at least 2 lines (URL + at least 1 path)"
+        exit 1
+    fi
+
+    URL=$(echo "$INPUT_CONTENT" | head -n 1)
+    PATHS=$(echo "$INPUT_CONTENT" | tail -n +2)
+    CLEAN_URL=$(echo "$URL" | tr -d '\r')
+    echo "DEBUG: First line captured as URL: '$CLEAN_URL'" >&2
+
+    if [[ ! "$CLEAN_URL" == *"FUZZ" ]]; then
+        # Add trailing slash if needed
+        if [[ ! "$CLEAN_URL" == */ ]] && [[ "$CLEAN_URL" != "" ]]; then
+            CLEAN_URL="$CLEAN_URL/"
+        fi
+        FUZZ_URL="${CLEAN_URL}FUZZ"
+    else
+        FUZZ_URL="$CLEAN_URL"
+    fi
+
+    echo "$FUZZ_URL" > "$URL_FILE"
+    echo "$PATHS" > "$PATHS_FILE"
+
+    echo ""
+    echo "=========================================="
+    echo "FUZZ Mode"
+    echo "Target URL: $FUZZ_URL"
+    echo "Paths: $(echo "$PATHS" | wc -l) lines"
+    echo "=========================================="
+    echo ""
+    echo "Running: gofuzz -FUZZ -u '$FUZZ_URL' -w '$PATHS_FILE' -rate 4"
+    echo ""
+    gofuzz -FUZZ "$FUZZ_URL" -w "$PATHS_FILE" -rate 4
+    rm -f "$URL_FILE" "$PATHS_FILE"
+
+elif [ "$MODE" = "HTTPX" ]; then
+    # HTTPX MODE
+    if [ "$LINE_COUNT" -lt 1 ]; then
+        echo "Error: HTTPX mode needs at least 1 URL"
+        exit 1
+    fi
+    echo "$INPUT_CONTENT" > "$URLS_FILE"
+    URL_COUNT=$(echo "$INPUT_CONTENT" | wc -l)
+    echo ""
+    echo "=========================================="
+    echo "HTTPX Mode"
+    echo "URLs to test: $URL_COUNT"
+    echo "=========================================="
+    echo ""
+    echo "Running: gofuzz -HTTPX '$URLS_FILE' -rate 4"
+    echo ""
+
+    gofuzz -HTTPX "$URLS_FILE" -rate 4
+
+    # Clean up file
+    rm -f "$URLS_FILE"
+fi
+
+find "$OUTPUT_DIR" -name "*.txt" -mmin +60 -delete 2>/dev/null || true
